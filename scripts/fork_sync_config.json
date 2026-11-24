@@ -1,0 +1,7 @@
+{
+ "upstream_repo": "ROCm/aiter",
+ "fork_repo": "amdsiloai/sgl-aiter",
+ "upstream_branch": "main",
+ "include_drafts": false,
+ "body_fallback": false
+}
