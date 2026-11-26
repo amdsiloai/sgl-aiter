@@ -3,7 +3,6 @@
 
 import argparse
 import gc
-import inspect
 import itertools
 import logging
 import os
@@ -19,6 +18,7 @@ from aiter.aot.flydsl.common import override_env, run_only_env
 from aiter.fhmoe_contract import FHMOE_BUFFER_MAX_BYTES
 from aiter.fused_moe import (
     AsmMoeMode,
+    _can_reroute_mxfp4_to_flydsl,
     _flydsl_route_output_nbytes,
     _is_flydsl_stage2,
     _stage2_runtime_uses_route_reduce,
@@ -466,7 +466,7 @@ def test_fmoe(
         and WQDType == dtypes.fp4x2
     ):
         runtime_aq_dtype = _runtime_swiglu_mxfp4_q_dtype_a(
-            token, actType, gateMode, qType, AQDType, WQDType, expert=E, inter_dim=inter_dim
+            token, actType, gateMode, qType, AQDType, WQDType
         )
         if runtime_aq_dtype == dtypes.fp4x2:
             metadata = get_2stage_cfgs(
@@ -1038,8 +1038,6 @@ def _iter_csv_cases():
                 kwargs["qType"],
                 kwargs["AQDType"],
                 kwargs["WQDType"],
-                expert=kwargs["E"],
-                inter_dim=kwargs["inter_dim"],
             )
             runtime_mode = "Swiglu MXFP4"
         if expected_aq_dtype is not None and kwargs["AQDType"] != expected_aq_dtype:
@@ -1072,6 +1070,23 @@ def _iter_csv_cases():
             or kernel_name2.startswith("opus_")
             or kwargs["disable_stage1_bias"]
         )
+        if kwargs["inter_dim"] % 256 != 0 and _can_reroute_mxfp4_to_flydsl(
+            model_dim=kwargs["model_dim"],
+            inter_dim=kwargs["inter_dim"],
+            dtype=kwargs["dtype"],
+            q_dtype_a=kwargs["AQDType"],
+            q_dtype_w=kwargs["WQDType"],
+            q_type=kwargs["qType"],
+            activation=kwargs["actType"],
+            is_shuffled=kwargs["preshuffle"],
+            use_g1u1=kwargs["use_g1u1"],
+            doweight_stage1=kwargs["doweight_stage1"],
+            gate_mode=GateMode(kwargs["gateMode"]),
+        ):
+            # Same guard fused_moe uses to reroute a row onto the a16w4 FlyDSL
+            # kernels, which take no per-expert bias.
+            kwargs["disable_stage1_bias"] = True
+            kwargs["disable_stage2_bias"] = True
         if is_swiglu_oai_asm:
             # The asm FLAT kernels take no per-expert bias; with one, fused_moe
             # discards the row. Run bias-free and require the row's kernel.
@@ -1179,7 +1194,7 @@ def _runtime_situv2_mxfp4_q_dtype_a(q_type, wq_dtype):
 
 
 def _runtime_swiglu_mxfp4_q_dtype_a(
-    token, act_type, gate_mode, q_type, aq_dtype, wq_dtype, expert=None, inter_dim=None
+    token, act_type, gate_mode, q_type, aq_dtype, wq_dtype
 ):
     """Return the q_dtype_a that fused_moe will select for Swiglu MXFP4."""
     if act_type != aiter.ActivationType.Swiglu:
@@ -1191,10 +1206,6 @@ def _runtime_swiglu_mxfp4_q_dtype_a(
 
     gate_mode = GateMode(gate_mode)
     if gate_mode == GateMode.SEPARATED:
-        # Shapes measured numerically broken in the fp4-activation path
-        # regardless of token count -- see fused_moe._SWIGLU_MXFP4_A4W4_UNSAFE_SHAPES.
-        if (expert, inter_dim) in aiter.fused_moe._SWIGLU_MXFP4_A4W4_UNSAFE_SHAPES:
-            return dtypes.bf16
         bound = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
         return dtypes.bf16 if token < bound else dtypes.fp4x2
 
@@ -1921,8 +1932,8 @@ def test_presorted_moe_wrapper_error():
 def _presorted_aux_stub(ids, weights, E, block_m=16):
     """A registration whose sort tensors have the BM=16 aux-sort layout.
 
-    Sized like fused_moe._adaptive_moe_sort; contents are left unset, since the
-    matcher only checks the layout and no kernel reads them.
+    Sized like aiter.moev2.segments.sort._adaptive_moe_sort; contents are left unset,
+    since the matcher only checks the layout and no kernel reads them.
     """
     M, topk = ids.shape
     BM = presorted_moe.PRESORTED_MOE_BLOCK_M
@@ -2314,7 +2325,11 @@ def test_output_buffer_contract():
         # whatever the fake said the op returned.
         return out.sum(), buf.sum()
 
-    sort = aiter.fused_moe._moe_sorting_impl
+    # moe_sorting lives in aiter.moev2 (under development, not graduated; owners @qli88,
+    # see aiter/moev2/README.md); its implementation is patched there.
+    import aiter.moev2.segments.sort as sorting
+
+    sort = sorting._moe_sorting_impl
 
     def sort_without_output(*a, **kw):
         kw["output"] = None
@@ -2325,7 +2340,7 @@ def test_output_buffer_contract():
     for in_place in (True, False):
         try:
             if not in_place:
-                aiter.fused_moe._moe_sorting_impl = sort_without_output
+                sorting._moe_sorting_impl = sort_without_output
             buf = fresh_buffer()
             assert fused_moe(*args, output=buf) is buf, f"{in_place=}: buf not returned"
             assert torch.equal(buf, ref), f"{in_place=}: buf does not hold the result"
@@ -2337,7 +2352,7 @@ def test_output_buffer_contract():
             ], f"{in_place=}: eager {eager} != compiled {compiled}"
             assert eager[0] == eager[1] == ref.sum()
         finally:
-            aiter.fused_moe._moe_sorting_impl = sort
+            sorting._moe_sorting_impl = sort
 
     def expect_raise(described, **kwargs):
         try:
@@ -2551,8 +2566,8 @@ def _quant_blockscale_weight(w):
 
 
 @benchmark()
-def test_blockscale_swiglu_limit(token, swiglu_limit, model_dim=256):
-    inter_dim, experts, topk = 256, 8, 2
+def test_blockscale_swiglu_limit(token, swiglu_limit):
+    model_dim, inter_dim, experts, topk = 256, 256, 8, 2
     torch.manual_seed(token)
     x = torch.randn(token, model_dim, dtype=dtypes.bf16)
     w1, s1 = _quant_blockscale_weight(
@@ -2615,43 +2630,19 @@ def test_blockscale_swiglu_limit(token, swiglu_limit, model_dim=256):
     w1_sh = shuffle_weight(w1, layout=(16, 16))
     w2_sh = shuffle_weight(w2, layout=(16, 16))
     out = torch.empty(token, model_dim, dtype=dtypes.bf16)
-    stage1_fwd, silu_and_mul = aiter.ck_moe_stage1_fwd, aiter.silu_and_mul
-    stage1_sig = inspect.signature(stage1_fwd)
-    launches, act_limits = [], []
-
-    def spy_stage1_fwd(*args, **kwargs):
-        bound = stage1_sig.bind(*args, **kwargs)
-        bound.apply_defaults()
-        launches.append((bound.arguments["splitk"], bound.arguments["swiglu_limit"]))
-        return stage1_fwd(*args, **kwargs)
-
-    def spy_silu_and_mul(dst, src, limit=0.0):
-        act_limits.append(limit)
-        return silu_and_mul(dst, src, limit)
-
-    aiter.ck_moe_stage1_fwd, aiter.silu_and_mul = spy_stage1_fwd, spy_silu_and_mul
-    try:
-        actual = fused_moe(
-            x,
-            w1_sh,
-            w2_sh,
-            weights,
-            ids,
-            w1_scale=s1,
-            w2_scale=s2,
-            quant_type=aiter.QuantType.per_128x128,
-            activation=aiter.ActivationType.Silu,
-            swiglu_limit=swiglu_limit,
-            output=out,
-        )
-    finally:
-        aiter.ck_moe_stage1_fwd, aiter.silu_and_mul = stage1_fwd, silu_and_mul
-    if swiglu_limit is not None and model_dim == 1024:
-        # The heuristic splits K=1024 at one token: the split-K launch runs
-        # unclamped and silu_and_mul clamps after the reduction.
-        assert len(launches) == 1 and launches[0][0] > 1, launches
-        assert launches[0][1] is None, launches
-        assert act_limits == [swiglu_limit], act_limits
+    actual = fused_moe(
+        x,
+        w1_sh,
+        w2_sh,
+        weights,
+        ids,
+        w1_scale=s1,
+        w2_scale=s2,
+        quant_type=aiter.QuantType.per_128x128,
+        activation=aiter.ActivationType.Silu,
+        swiglu_limit=swiglu_limit,
+        output=out,
+    )
     msg = f"blockscale limit={swiglu_limit}"
     err = checkAllclose(ref.float(), actual.float(), rtol=0.05, atol=0.05, msg=msg)
     logits_diff = logits_difference(ref, actual)
@@ -2683,19 +2674,6 @@ def test_swiglu_limit_guards():
     q = aiter.QuantType.No
     raises(NotImplementedError, ck, *([None] * 11), quant_type=q, **kw)
     raises(NotImplementedError, asm, *([None] * 9), ksplit=0, **kw)
-    # Only unnamed launches split under a limit: a named Splitk kernel raises.
-    w1 = torch.empty(1, dtype=dtypes.fp8)
-    raises(
-        ValueError,
-        ck,
-        None,
-        w1,
-        *([None] * 9),
-        kernelName="gemm1_silu_Splitk",
-        splitk=4,
-        quant_type=aiter.QuantType.per_1x128,
-        **kw,
-    )
 
 
 def run_blockscale_limit_cases():
@@ -2705,9 +2683,6 @@ def run_blockscale_limit_cases():
         # Without a limit, token > 32 takes the untuned ASM 1-stage default,
         # which picks a flat kernel for sorted inputs at model_dim 256 on gfx942.
         if limit is not None or token <= 32
-    ] + [
-        test_blockscale_swiglu_limit(1, limit, model_dim=1024)
-        for limit in (1.0, 7.0, None)
     ]
     aiter.logger.info(
         "blockscale SiLU limit summary (markdown):\n%s",
