@@ -65,12 +65,10 @@ from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_delta_attn_utils imp
     exp,
     exp2,
     input_guard,
-    upload_ints,
-    wait_for_upload,
+    tensor_cache,
 )
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.index import (
-    chunk_index_pairs,
-    seq_bounds,
+    prepare_chunk_indices,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
@@ -1083,30 +1081,35 @@ def _choose_chunks_per_seg(n_chunks_max: int, n_seqs: int, H: int, V: int) -> in
     return max(1, min(n_chunks_max, 1 << round(math.log2(n_chunks_max / segs))))
 
 
-def _align4(n: int) -> int:
-    # 16 bytes of int32: fast_launch keys on 16-byte pointer alignment.
-    return -(-n // 4) * 4
+@tensor_cache
+def _seq_bounds(cu_seqlens: torch.Tensor) -> tuple[tuple[int, int], ...]:
+    """``(bos, eos)`` per sequence.
+
+    Cached because reading it is a device-to-host copy issued after the prepare
+    kernel has been queued, so an uncached call stalls the host on that kernel
+    on every invocation rather than only on the first.
+    """
+    bounds = cu_seqlens.tolist()
+    return tuple((bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1))
 
 
 @functools.lru_cache(maxsize=64)
-def _build_metadata(
+def _build_segments(
     seqs: tuple[tuple[int, int], ...],
     C: int,
     chunks_per_seg: int,
     device: torch.device,
 ):
-    """K1's chunk indices and the descriptors for the segmented recurrence.
+    """Descriptors for the segmented recurrence.
 
-    Returns ``(chunk_indices, desc, seq_seg_off, num_segs, max_segs_per_seq,
-    ticket)``. ``chunk_indices`` is ``prepare_chunk_indices``' ``[NT, 2]`` table.
-    ``desc`` is a ``[6, num_segs]`` int32 tensor holding, per segment: the
-    global chunk index it starts at (indexing the K1 workspace), its chunk
-    count, its first and one-past-last token, its sequence, and whether it ends
-    that sequence. All three share one buffer and one non-blocking upload, whose
-    ``ticket`` is what ``wait_for_upload`` takes.
+    Returns ``(desc, seq_seg_off, num_segs, max_segs_per_seq)`` where ``desc`` is
+    a ``[6, num_segs]`` int32 tensor holding, per segment: the global chunk index
+    it starts at (indexing the K1 workspace), its chunk count, its first and
+    one-past-last token, its sequence, and whether it ends that sequence.
 
-    Cached on the sequence bounds, so the layers of a forward pass share the
-    Python loop and the upload.
+    Cached on the sequence bounds: building these costs a Python loop and a host
+    to device copy, which at this kernel's runtime is not noise, and a serving
+    loop repeats the same shapes.
     """
     chunk_base, nchunks, tok_base, tok_end, seq_id, is_last = [], [], [], [], [], []
     seq_seg_off = [0]
@@ -1126,29 +1129,16 @@ def _build_metadata(
         seq_seg_off.append(len(chunk_base))
         g_chunk += nch
 
-    num_segs = len(chunk_base)
-    pairs = chunk_index_pairs(seqs, C)
-    desc_at = _align4(len(pairs))
-    off_at = desc_at + _align4(6 * num_segs)
-    buf = [0] * (off_at + len(seq_seg_off))
-    buf[: len(pairs)] = pairs
-    buf[desc_at : desc_at + 6 * num_segs] = (
-        chunk_base + nchunks + tok_base + tok_end + seq_id + is_last
+    desc = torch.tensor(
+        [chunk_base, nchunks, tok_base, tok_end, seq_id, is_last],
+        dtype=torch.int32,
+        device=device,
     )
-    buf[off_at:] = seq_seg_off
-    dev_buf, ticket = upload_ints(buf, torch.int32, device)
-
+    off = torch.tensor(seq_seg_off, dtype=torch.int32, device=device)
     max_per_seq = max(
         seq_seg_off[i + 1] - seq_seg_off[i] for i in range(len(seq_seg_off) - 1)
     )
-    return (
-        dev_buf[: len(pairs)].view(-1, 2),
-        dev_buf[desc_at : desc_at + 6 * num_segs].view(6, num_segs),
-        dev_buf[off_at:],
-        num_segs,
-        max_per_seq,
-        ticket,
-    )
+    return desc, off, len(chunk_base), max_per_seq
 
 
 # key_shapes=False: the heuristics of these kernels only test arguments for
@@ -1215,7 +1205,6 @@ def flash_kda_fwd(
     state_cache: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
-    cu_seqlens_cpu: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
     Two-kernel KDA forward, with an optional segmented (context parallel) scan.
@@ -1235,8 +1224,8 @@ def flash_kda_fwd(
         output_final_state: Allocate and return the final state.
         state_v_first:      V-first state layout.
         cu_seqlens:         ``[N + 1]`` for varlen; ``B`` must be 1.
-        chunk_indices:      Output of ``prepare_chunk_indices``; built here
-                            from the sequence bounds when omitted.
+        chunk_indices:      Output of ``prepare_chunk_indices``; computed here
+                            when omitted.
         chunks_per_seg:     Segment length for the parallel scan. None picks a
                             value from the head count; <= 0 disables it.
         out:                Optional output buffer, same shape as ``v``, and
@@ -1253,10 +1242,6 @@ def flash_kda_fwd(
                             ``[0, slots)``. Not range-checked: that would
                             need a host sync per call.
         has_initial_state:  Bool ``[N]``; false starts that sequence from zero.
-        cu_seqlens_cpu:     ``cu_seqlens`` on the host, trusted to hold the same
-                            values. When given, ``cu_seqlens`` is never read
-                            back to the host; otherwise it is read once per
-                            tensor (``seq_bounds``).
 
     Returns:
         ``(o, final_state)`` with ``o`` shaped like ``v``. ``final_state`` is
@@ -1311,13 +1296,15 @@ def flash_kda_fwd(
     if cu_seqlens is not None:
         if B != 1:
             raise ValueError(f"Varlen mode requires B=1, got {B}.")
+        if chunk_indices is None:
+            chunk_indices = prepare_chunk_indices(cu_seqlens, C)
         N = cu_seqlens.numel() - 1
         NT = 0
-        seqs = seq_bounds(cu_seqlens, cu_seqlens_cpu)
+        total_tiles = chunk_indices.shape[0]
     else:
         N = B
         NT = triton.cdiv(T, C)
-        seqs = tuple((b * T, b * T + T) for b in range(B))
+        total_tiles = B * NT
 
     if paged:
         _check_paged_state_cache(
@@ -1330,26 +1317,21 @@ def flash_kda_fwd(
             K=K,
         )
 
+    if cu_seqlens is not None:
+        seqs = _seq_bounds(cu_seqlens)
+    else:
+        seqs = tuple((b * T, b * T + T) for b in range(B))
+
     # Longest sequence in chunks: segmentation is judged per sequence, and
-    # passing it as the segment length is what disables segmentation.
+    # passing it as the segment length is what disables segmentation. Resolved
+    # here rather than next to _build_segments because K1 launches first and the
+    # cache modifiers below depend on the answer.
     n_chunks_max = max(triton.cdiv(eos - bos, C) for bos, eos in seqs)
     if chunks_per_seg is None:
         chunks_per_seg = _choose_chunks_per_seg(n_chunks_max, N, H, V)
     elif chunks_per_seg <= 0:
         chunks_per_seg = n_chunks_max
     segmented = n_chunks_max > chunks_per_seg
-
-    built_indices, desc, seq_seg_off, num_segs, max_segs, upload_ticket = (
-        _build_metadata(seqs, C, chunks_per_seg, dev)
-    )
-    # The three tables are views of one buffer, which built_indices starts.
-    wait_for_upload(upload_ticket, built_indices)
-    if cu_seqlens is not None:
-        if chunk_indices is None:
-            chunk_indices = built_indices
-        total_tiles = chunk_indices.shape[0]
-    else:
-        total_tiles = B * NT
 
     CM_LOAD = ".cg"
     CM_STORE = "" if segmented else ".wt"
@@ -1472,6 +1454,9 @@ def flash_kda_fwd(
             CM_WS=CM_STORE,
         )
 
+    desc, seq_seg_off, num_segs, max_segs = _build_segments(
+        seqs, C, chunks_per_seg, dev
+    )
     seg_chunk_base, seg_nchunks, seg_tok_base, seg_tok_end, seg_seq, seg_is_last = desc
 
     # The kernel indexes h_in by segment, so normalize a V-first initial state

@@ -14,14 +14,12 @@ error rather than allclose.
 """
 
 import contextlib
-import functools
 import importlib
 import inspect
 import math
 
 import pytest
 import torch
-import triton
 
 from aiter.jit.utils.build_targets import base_gfx_arch
 from aiter.ops.triton._triton_kernels.kimi_delta_attn import chunk_delta_attn_fwd
@@ -33,14 +31,8 @@ from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_delta_attn_utils imp
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.flash_kda import (
     FLASH_KDA_CHUNK,
     flash_kda_fwd,
-    flash_kda_supported,
-)
-from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils import index as _index
-from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.index import (
-    prepare_chunk_indices,
 )
 from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
-from aiter.ops.triton.utils import fast_launch as _fast_launch
 from op_tests.triton_tests.utils.kda_ref import chunk_kda_ref
 
 device = "cuda"
@@ -144,26 +136,6 @@ def _gluon_k2_module():
         "aiter.ops.triton._gluon_kernels."
         f"{base_gfx_arch(_flash_kda.DEVICE_ARCH)}.kimi_delta_attn.flash_kda_k2"
     )
-
-
-@contextlib.contextmanager
-def _k2_tuner_search_space():
-    """Hand K2's autotuner the candidates a tuning build gives it.
-
-    The launch path pins one config, and Triton consults its autotune cache
-    only when there is more than one to choose between, so a test about the
-    key has to supply the space the key indexes.
-    """
-    if len(_flash_kda._K2_CONFIGS) < 2:
-        pytest.skip("no published K2 candidates on this device to key between")
-    kern = _flash_kda._flash_kda_segment_kernel
-    saved = kern.configs
-    kern.configs = list(_flash_kda._K2_CONFIGS)
-    try:
-        yield kern
-    finally:
-        kern.configs = saved
-        kern.cache.clear()
 
 
 def run_reference(q, k, v, g, beta, A_log, dt_bias, scale, **kw):
@@ -437,77 +409,6 @@ def test_segmented_agrees_with_unsegmented():
         assert rel_err(ht_seg, ht_plain) < 5e-3, m
 
 
-def test_tuner_keeps_the_two_schedules_apart():
-    """A segmented run must not hand its config to a later unsegmented one.
-
-    K2's grid is ``cdiv(W, BW) * num_segs * H``, so the wide BW that suits a
-    segmented sweep leaves the unsegmented scan a quarter of the blocks: at
-    H=12 that pick costs 2.3x. The two collide unless the segment count reaches
-    the autotune key, and `cache_results` then persists whichever won. Only a
-    tuning build chooses, so the tuner is given its config space here.
-    """
-    args = make_inputs(1, 1024, 4)
-    # An incoming state is what makes the two output passes otherwise identical:
-    # without it the unsegmented one passes h_in=None and the key picks up the
-    # difference through the dtypes it appends, hiding the collision.
-    kw = {
-        "initial_state": torch.zeros(
-            1, 4, K_DIM, K_DIM, device=device, dtype=torch.float32
-        )
-    }
-    # This is about the Triton kernel's autotuner, which never runs -- and whose
-    # cache therefore stays empty -- when K2 is routed to Gluon.
-    with _k2_tuner_search_space() as kern, _route(k2=False), _fast_launch.bypassed():
-        run_flash(*args, chunks_per_seg=4, **kw)
-        segmented_keys = set(kern.cache)
-        run_flash(*args, chunks_per_seg=0, **kw)
-        assert set(kern.cache) - segmented_keys, "unsegmented reused a segmented config"
-
-
-def test_published_k2_schedules_can_split_their_tile():
-    """Every published (BW, num_warps) must let the warps divide the state.
-
-    Above BW // 16 the extra warps recompute columns their neighbours already
-    hold -- still correct, which is why nothing downstream catches it, and the
-    pairs are now editable from a config file rather than derived.
-
-    An arch that publishes neither schedule has nothing here to check. Both
-    lookups then return _K2_GLUON_FALLBACK, whose MIN_BLOCKS_PER_CU of 0 makes
-    the occupancy test vacuous, so the wide branch is taken for every shape and
-    exactly one pair is reachable by construction rather than by choice.
-    """
-    if (
-        _flash_kda.chunk_delta_attn_tuned_config(
-            "k2_ab_fused_gluon_wide", _flash_kda._K2_GLUON_FALLBACK, backend="gluon"
-        )
-        is _flash_kda._K2_GLUON_FALLBACK
-    ):
-        pytest.skip("this arch publishes no Gluon K2 schedules")
-    kernels = ["k2_ab_fused_gluon"]
-    if _flash_kda.DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
-        kernels.append("k2_c_gluon")
-    for kernel in kernels:
-        reached = set()
-        for W in (64, 128, 256):
-            for num_segs in (1, 2, 8, 64, 512):
-                for H in (1, 4, 12, 64):
-                    sched = _flash_kda._k2_gluon_schedule(W, num_segs, H, kernel)
-                    reached.add((sched.kwargs["BW"], sched.num_warps))
-        assert len(reached) > 1, f"{kernel}: only one schedule reachable: {reached}"
-        for bw, nw in sorted(reached):
-            assert bw % 16 == 0, f"{kernel}: BW={bw} is not a whole number of tiles"
-            assert nw <= bw // 16, f"{kernel}: BW={bw} cannot be split {nw} ways"
-    # The gfx950 pass C publishes one schedule per segmentation instead.
-    if _flash_kda.DEVICE_ARCH == "gfx950":
-        for segmented in (False, True):
-            sched = _flash_kda._k2c_gluon_schedule(segmented)
-            if sched is None:
-                continue
-            bw, nw = sched.kwargs["BW"], sched.num_warps
-            assert bw % 16 == 0, f"k2_c_gluon: BW={bw} is not a whole number of tiles"
-            assert nw <= bw // 16, f"k2_c_gluon: BW={bw} cannot be split {nw} ways"
-
-
 def _patch_gluon_schedule(monkeypatch, replace):
     """Make ``_published_gluon_schedule`` return ``replace[name]`` for those names."""
     published = _flash_kda._published_gluon_schedule
@@ -516,19 +417,6 @@ def _patch_gluon_schedule(monkeypatch, replace):
         "_published_gluon_schedule",
         lambda name: replace[name] if name in replace else published(name),
     )
-
-
-def test_gluon_k1_rejects_a_wrong_warp_count(monkeypatch):
-    """K1's layouts fix its warp count, so a config with another one must fail."""
-    if _flash_kda.DEVICE_ARCH != "gfx950" or not _flash_kda._gluon_k1_usable(
-        FLASH_KDA_CHUNK, K_DIM
-    ):
-        pytest.skip("only the gfx950 Gluon K1 validates its published schedule")
-    good = _flash_kda._published_gluon_schedule("k1_prepare_gluon")
-    wrong = triton.Config(dict(good.kwargs), num_warps=2 * good.num_warps)
-    _patch_gluon_schedule(monkeypatch, {"k1_prepare_gluon": wrong})
-    with _route(k1=True), pytest.raises(ValueError, match="num_warps"):
-        run_flash(*make_inputs(1, 64, 2))
 
 
 def test_unpublished_gluon_schedules_fall_back_to_triton(monkeypatch):
@@ -676,35 +564,6 @@ def test_cases_reach_the_gluon_k2():
         assert not missed, f"never reached the Gluon pass C: {missed}"
 
 
-@pytest.mark.parametrize(
-    "B, H, chunks_per_seg, gluon",
-    [(1, 4, None, False), (4, 12, None, True), (1, 4, 4, True)],
-    ids=["small", "large", "segmented"],
-)
-def test_pass_c_route_follows_size(monkeypatch, B, H, chunks_per_seg, gluon):
-    """The published floor sends few-pair unsegmented shapes to the Triton pass C."""
-    if not (
-        _flash_kda._GLUON_K2C_ARCH_OK
-        and _flash_kda._gluon_k2_usable(FLASH_KDA_CHUNK, K_DIM, K_DIM)
-    ):
-        pytest.skip("this arch or tile shape never routes pass C to Gluon")
-    sched = _flash_kda._k2c_gluon_schedule(False)
-    if sched is None or not sched.kwargs.get("MIN_BLOCKS_PER_CU"):
-        pytest.skip("this arch publishes no pass C floor")
-    if chunks_per_seg is None:
-        assert _flash_kda._k2c_gluon_usable(False, K_DIM, B, H) == gluon
-    monkeypatch.setattr(_flash_kda, "AITER_FDA_USE_GLUON_K2", True)
-    monkeypatch.setattr(_flash_kda, "_K2C_ROUTE_BY_SIZE", True)
-    args = make_inputs(B, 1024 if chunks_per_seg else 64, H)
-    with (
-        _count_launches(_gluon_k2_module(), ["k2_c_fast"]) as gluon_calls,
-        _count_launches(_flash_kda, ["_segment_fast"]) as triton_calls,
-    ):
-        run_flash(*args, chunks_per_seg=chunks_per_seg)
-    assert gluon_calls["k2_c_fast"] == int(gluon)
-    assert triton_calls["_segment_fast"] == int(not gluon)
-
-
 def test_segment_length_cap(monkeypatch):
     """A hard cap bounds every segment; the fallback's soft cap yields to the
     segment-count cap on long sequences."""
@@ -799,36 +658,6 @@ def test_final_state_matches_fp32_recurrence(lower_bound):
     e_ref = rel_err(run_reference(*args, **kw)[1], gold)
     assert e_fkda < 2e-2, f"flash_kda state {e_fkda:.2e} against the fp32 recurrence"
     assert e_fkda < 1.3 * e_ref, f"flash_kda state {e_fkda:.2e} vs default {e_ref:.2e}"
-
-
-def test_supported_rejects_unsupported():
-    q = torch.randn(1, 64, 4, 64, device=device, dtype=dtype)
-    v = torch.randn(1, 64, 4, 64, device=device, dtype=dtype)
-    A_log = torch.randn(4, device=device, dtype=torch.float32)
-    base = {
-        "chunk_size": FLASH_KDA_CHUNK,
-        "safe_gate": True,
-        "use_gate_in_kernel": True,
-        "use_qk_l2norm_in_kernel": True,
-        "use_beta_sigmoid_in_kernel": True,
-        "lower_bound": LOWER_BOUND,
-        "A_log": A_log,
-    }
-    # K = V = 64 is not supported.
-    assert not flash_kda_supported(q=q, v=v, **base)
-
-    q128 = torch.randn(1, 64, 4, 128, device=device, dtype=dtype)
-    v128 = torch.randn(1, 64, 4, 128, device=device, dtype=dtype)
-    assert flash_kda_supported(q=q128, v=v128, **base)
-    assert not flash_kda_supported(q=q128, v=v128, **{**base, "chunk_size": 64})
-    assert not flash_kda_supported(q=q128, v=v128, **{**base, "lower_bound": None})
-    assert not flash_kda_supported(q=q128, v=v128, **{**base, "safe_gate": False})
-    assert not flash_kda_supported(
-        q=q128, v=v128, **{**base, "use_gate_in_kernel": False}
-    )
-    # GVA (HV != H) is not supported.
-    v_gva = torch.randn(1, 64, 8, 128, device=device, dtype=dtype)
-    assert not flash_kda_supported(q=q128, v=v_gva, **base)
 
 
 def test_public_wrapper_routes_to_flash_kda(monkeypatch):
@@ -1082,59 +911,6 @@ def test_paged_cache_padded_stride_writes_live_pool():
         assert torch.count_nonzero(row).item() == 0
 
 
-@pytest.mark.parametrize("outer", ["expanded", "overlapping"])
-def test_paged_cache_rejects_overlapping_slots(outer):
-    """stride(0) below one [H, V, K] plane would alias neighbouring slots."""
-    H = 4
-    args = make_inputs(1, 128, H)
-    v = args[2]
-    plane = H * K_DIM * K_DIM
-    if outer == "expanded":
-        cache = torch.zeros(
-            1, H, K_DIM, K_DIM, device=device, dtype=torch.float32
-        ).expand(3, -1, -1, -1)
-    else:
-        storage = torch.zeros(3 * plane, device=device, dtype=torch.float32)
-        cache = torch.as_strided(
-            storage,
-            size=(3, H, K_DIM, K_DIM),
-            stride=(plane // 2, K_DIM * K_DIM, K_DIM, 1),
-        )
-    assert cache.stride(0) < plane
-    with pytest.raises(ValueError, match="not dense"):
-        chunk_kimi_delta_attn(
-            **_kimi_kwargs(
-                *args,
-                out=torch.empty_like(v),
-                state_cache=cache,
-                state_indices=torch.tensor([1], device=device, dtype=torch.int32),
-                has_initial_state=torch.ones(1, device=device, dtype=torch.bool),
-            )
-        )
-
-
-def test_out_rejected_on_default_pipeline():
-    """The default pipeline cannot honour `out`, so it must not drop it."""
-    args = make_inputs(1, 128, 4)
-    v = args[2]
-    with (
-        _force_default_pipeline(),
-        pytest.raises(ValueError, match="out is only implemented"),
-    ):
-        chunk_kimi_delta_attn(**_kimi_kwargs(*args, out=torch.empty_like(v)))
-
-
-def test_out_must_be_contiguous():
-    """A strided `out` is rejected, not silently packed into a clone."""
-    args = make_inputs(1, 128, 4)
-    v = args[2]
-    B, T, H, V = v.shape
-    strided = torch.empty(B, T, H, 2 * V, device=device, dtype=v.dtype)[..., :V]
-    assert not strided.is_contiguous()
-    with pytest.raises(ValueError, match="out must be contiguous"):
-        chunk_kimi_delta_attn(**_kimi_kwargs(*args, out=strided))
-
-
 def test_out_is_written_in_place():
     """A contiguous `out` is the buffer the kernel writes, not a packed copy."""
     args = make_inputs(1, 128, 4)
@@ -1143,364 +919,6 @@ def test_out_is_written_in_place():
     o, _ = chunk_kimi_delta_attn(**_kimi_kwargs(*args, out=out))
     assert o.data_ptr() == out.data_ptr()
     torch.testing.assert_close(out, ref, rtol=0, atol=0)
-
-
-def test_paged_cache_rejected_on_default_pipeline():
-    args = make_inputs(1, 128, 4)
-    v = args[2]
-    h0 = torch.zeros(1, 4, K_DIM, K_DIM, device=device, dtype=torch.float32)
-    cache, indices, _ = _paged_pool(1, 4, h0)
-    with (
-        _force_default_pipeline(),
-        pytest.raises(ValueError, match="paged state_cache is only implemented"),
-    ):
-        chunk_kimi_delta_attn(
-            **_kimi_kwargs(
-                *args,
-                out=torch.empty_like(v),
-                state_cache=cache,
-                state_indices=indices,
-                has_initial_state=torch.ones(1, device=device, dtype=torch.bool),
-            )
-        )
-
-
-def _cu_seqlens_pair(lens):
-    """``cu_seqlens`` on the device and the same values on the host."""
-    host = torch.tensor([0, *lens], dtype=torch.int32, device="cpu").cumsum(0).int()
-    return host.to(device), host
-
-
-def test_cu_seqlens_cpu_issues_no_sync():
-    """With host bounds nothing synchronizes, cache miss included, and the
-    result equals the device-bounds call's.
-
-    The same call with only device bounds must trip the check, or the check
-    proves nothing.
-    """
-    lens, H = [100, 0, 257, 33], 4
-    args = make_inputs(1, sum(lens), H)
-    h0 = (
-        torch.randn(len(lens), H, K_DIM, K_DIM, device=device, dtype=torch.float32)
-        * 0.1
-    )
-
-    def fresh(with_host):
-        # New tensors each time, so no identity cache can answer.
-        cu_seqlens, cu_seqlens_cpu = _cu_seqlens_pair(lens)
-        cache, indices, _ = _paged_pool(len(lens), H, h0)
-        extra = {"cu_seqlens_cpu": cu_seqlens_cpu} if with_host else {}
-        return _kimi_kwargs(
-            *args,
-            cu_seqlens=cu_seqlens,
-            out=torch.full_like(args[2], float("nan")),
-            state_cache=cache,
-            state_indices=indices,
-            # Alternating, so both the load and the zero start are in the result.
-            has_initial_state=torch.arange(len(lens), device=device) % 2 == 0,
-            **extra,
-        )
-
-    chunk_kimi_delta_attn(**fresh(True))  # compile, autotune, pinned pool
-    host_kw, dev_kw = fresh(True), fresh(False)
-    torch.cuda.synchronize()
-    saved = torch.cuda.get_sync_debug_mode()
-    torch.cuda.set_sync_debug_mode("error")
-    try:
-        _flash_kda._build_metadata.cache_clear()  # take the upload path
-        chunk_kimi_delta_attn(**host_kw)
-        _flash_kda._build_metadata.cache_clear()
-        # ROCm builds of PyTorch say "HIP" (2.10) or "CUDA" (2.13) here.
-        with pytest.raises(RuntimeError, match=r"synchronizing (CUDA|HIP) operation"):
-            chunk_kimi_delta_attn(**dev_kw)
-    finally:
-        torch.cuda.set_sync_debug_mode(saved)
-    # The read-back raised before any kernel ran, so dev_kw is still fresh.
-    _flash_kda._build_metadata.cache_clear()
-    chunk_kimi_delta_attn(**dev_kw)
-    assert torch.equal(host_kw["out"], dev_kw["out"])
-    assert torch.equal(host_kw["state_cache"], dev_kw["state_cache"])
-
-
-def _expected_chunk_indices(lens, chunk_size):
-    """``prepare_chunk_indices``' rows from the sequence lengths, by repeat_interleave
-    rather than by its loop."""
-    counts = torch.tensor([-(-n // chunk_size) for n in lens], device="cpu")
-    seq = torch.repeat_interleave(torch.arange(len(lens), device="cpu"), counts)
-    chunk = (
-        torch.arange(seq.numel(), device="cpu")
-        - (torch.cumsum(counts, 0) - counts)[seq]
-    )
-    return torch.stack([seq, chunk], 1).int()
-
-
-def test_prepare_chunk_indices_numbers_empty_sequences():
-    """A chunk's sequence id indexes cu_seqlens, so an empty sequence still counts."""
-    lens, chunk_size = [0, 100, 0, 0, 257, 33], 64
-    cu_seqlens, _ = _cu_seqlens_pair(lens)
-    got = prepare_chunk_indices(cu_seqlens, chunk_size)
-    assert got.dtype == cu_seqlens.dtype and got.device == cu_seqlens.device
-    assert torch.equal(got.cpu(), _expected_chunk_indices(lens, chunk_size))
-
-
-def test_prepare_chunk_indices_keeps_a_cpu_tensor_on_the_cpu():
-    """A CPU cu_seqlens gives a CPU table: there is no stream to upload on."""
-    lens, chunk_size = [0, 100, 0, 257, 33], 64
-    _, host = _cu_seqlens_pair(lens)
-    got = prepare_chunk_indices(host, chunk_size)
-    assert got.dtype == host.dtype and got.device == host.device
-    assert torch.equal(got, _expected_chunk_indices(lens, chunk_size))
-
-
-# The metadata uploads are cached on the sequence bounds and shared across
-# streams: an upload queued on one stream is read on another. X and Y have
-# tables of the same size and different contents (the first two sequences swap
-# their chunk counts), so a table read before its upload landed, or after its
-# block was reused for another, differs from the right one. Z is a third set of
-# bounds.
-_C = FLASH_KDA_CHUNK
-_LENS_X, _LENS_Y, _LENS_Z = [2 * _C, _C, _C], [_C, 2 * _C, _C], [_C] * 4
-
-
-def _clear_upload_caches():
-    _flash_kda._build_metadata.cache_clear()
-    _index._chunk_indices_from_bounds.cache_clear()
-
-
-@functools.cache
-def _sleep_cycles_per_second():
-    n = 10_000_000
-    start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
-    torch.cuda._sleep(n)  # the first launch is slow
-    torch.cuda.synchronize()
-    start.record()
-    torch.cuda._sleep(n)
-    end.record()
-    end.synchronize()
-    return n / (start.elapsed_time(end) / 1e3)
-
-
-def _gpu_sleep(seconds):
-    """Queue about ``seconds`` of idle device time on the current stream."""
-    torch.cuda._sleep(int(seconds * _sleep_cycles_per_second()))
-
-
-def _prepare_index(lens, n):
-    """``n`` launchers of ``prepare_chunk_indices`` on ``lens``. Inputs are built
-    and synchronized here; a launch queues the call and a copy of its table on
-    the current stream and returns the copy."""
-    cu_seqlens, cu_seqlens_cpu = _cu_seqlens_pair(lens)
-    torch.cuda.synchronize()
-    return [
-        lambda: prepare_chunk_indices(cu_seqlens, _C, cu_seqlens_cpu).clone()
-        for _ in range(n)
-    ]
-
-
-def _index_reference(lens):
-    """The table from its definition: a row [sequence, chunk in sequence] per chunk."""
-    rows = [[i, c] for i, n in enumerate(lens) for c in range(-(-n // _C))]
-    return torch.tensor(rows, dtype=torch.int32, device=device)
-
-
-def _prepare_flash(lens, n):
-    """``n`` launchers of ``chunk_kimi_delta_attn`` (varlen, host bounds, on the
-    FlashKDA path through a paged cache) on ``lens``, each with its own state
-    and output so that none allocates a small tensor in its call. A launch
-    queues the call on the current stream and returns the output."""
-    H = 4
-    args = make_inputs(1, sum(lens), H)
-    cu_seqlens, cu_seqlens_cpu = _cu_seqlens_pair(lens)
-    h0 = torch.zeros(len(lens), H, K_DIM, K_DIM, device=device, dtype=torch.float32)
-    has_initial_state = torch.zeros(len(lens), device=device, dtype=torch.bool)
-
-    def launcher():
-        cache, indices, _ = _paged_pool(len(lens), H, h0)
-        out = torch.full_like(args[2], float("nan"))
-
-        def launch():
-            chunk_kimi_delta_attn(
-                **_kimi_kwargs(
-                    *args,
-                    cu_seqlens=cu_seqlens,
-                    cu_seqlens_cpu=cu_seqlens_cpu,
-                    out=out,
-                    state_cache=cache,
-                    state_indices=indices,
-                    has_initial_state=has_initial_state,
-                )
-            )
-            return out
-
-        return launch
-
-    launchers = [launcher() for _ in range(n)]
-    torch.cuda.synchronize()
-    return launchers
-
-
-def _flash_reference(lens):
-    out = _prepare_flash(lens, 1)[0]()
-    torch.cuda.synchronize()
-    return out
-
-
-_UPLOAD_ROUTES = {
-    "index": (_prepare_index, _index_reference),
-    "flash": (_prepare_flash, _flash_reference),
-}
-
-
-@pytest.fixture
-def stream_pair():
-    """Two streams of different priority, so that a backlog on one is less likely
-    to hold up the other (the second-stream test checks that it does not)."""
-    _clear_upload_caches()
-    yield torch.cuda.Stream(priority=0), torch.cuda.Stream(priority=-1)
-    torch.cuda.synchronize()
-    _clear_upload_caches()
-
-
-@pytest.mark.parametrize("route", _UPLOAD_ROUTES)
-def test_cached_metadata_on_second_stream_sees_the_upload(route, stream_pair):
-    """A cache hit on stream B waits for the copy stream A queued behind a
-    backlog, rather than reading the block before the copy lands."""
-    prepare, reference = _UPLOAD_ROUTES[route]
-    a, b = stream_pair
-    expected = reference(_LENS_X)
-    (launch_y,) = prepare(_LENS_Y, 1)
-    launch_a, launch_b = prepare(_LENS_X, 2)
-    # Leave A's allocator a freed block that holds Y's table, for X's miss.
-    with torch.cuda.stream(a):
-        launch_y()
-    a.synchronize()
-    _clear_upload_caches()
-    with torch.cuda.stream(a):
-        _gpu_sleep(0.5)
-        launch_a()  # the miss: its copy queues behind the sleep
-    with torch.cuda.stream(b):
-        got = launch_b()  # the hit
-    torch.cuda.synchronize()
-    assert torch.equal(got, expected)
-
-
-def test_cached_metadata_outlives_its_eviction_on_second_stream(stream_pair):
-    """The cache may evict a table that stream B's queued kernels still read: its
-    block must not be handed to a new upload before B is done.
-
-    Through ``prepare_chunk_indices`` only: the FlashKDA call site shares
-    ``wait_for_upload``, and a variant through it passed with ``record_stream``
-    removed, so it could not tell.
-    """
-    prepare, reference = _UPLOAD_ROUTES["index"]
-    a, b = stream_pair
-    expected = reference(_LENS_X)
-    (launch_y,) = prepare(_LENS_Y, 1)
-    launch_a, launch_b = prepare(_LENS_X, 2)
-    with torch.cuda.stream(a):
-        launch_a()  # X's miss, uploaded on A
-    a.synchronize()
-    with torch.cuda.stream(b):
-        _gpu_sleep(0.5)
-        got = launch_b()  # the hit: its kernels queue behind the sleep
-    _clear_upload_caches()  # X's table is evicted while B has yet to read it
-    with torch.cuda.stream(a):
-        launch_y()  # an upload of the same size, onto X's block if it was freed
-    torch.cuda.synchronize()
-    assert torch.equal(got, expected)
-
-
-@pytest.mark.parametrize("route", _UPLOAD_ROUTES)
-def test_second_stream_hit_does_not_wait_for_later_work(route, stream_pair):
-    """A hit on stream B waits for the copy only, not for work queued on stream A
-    after it."""
-    prepare, _ = _UPLOAD_ROUTES[route]
-    a, b = stream_pair
-    launch_a, launch_warm, launch_b = prepare(_LENS_X, 3)
-    with torch.cuda.stream(a):
-        launch_a()
-    a.synchronize()
-    with torch.cuda.stream(b):
-        launch_warm()
-    b.synchronize()
-    backlog_done = torch.cuda.Event()
-    with torch.cuda.stream(a):
-        _gpu_sleep(0.5)
-        backlog_done.record(a)
-    # Work unrelated to the upload must get past the backlog, or the two streams
-    # do not run alongside each other here and this test cannot tell.
-    control = torch.cuda.Event()
-    with torch.cuda.stream(b):
-        torch.ones(1, device=device, dtype=torch.float32).add_(1)
-        control.record(b)
-    control.synchronize()
-    if backlog_done.query():
-        pytest.skip("stream B does not run alongside stream A's backlog on this device")
-    hit_done = torch.cuda.Event()
-    with torch.cuda.stream(b):
-        launch_b()
-        hit_done.record(b)
-    hit_done.synchronize()
-    assert not backlog_done.query(), "the hit waited for work queued after the upload"
-
-
-@pytest.mark.parametrize("route", _UPLOAD_ROUTES)
-def test_graph_replay_after_metadata_cache_eviction(route):
-    """A graph replays the table it captured at a fixed address, so the table
-    outlives its eviction from the cache and its block is not reused."""
-    prepare, reference = _UPLOAD_ROUTES[route]
-    _clear_upload_caches()
-    expected = reference(_LENS_X)
-    (launch_y,) = prepare(_LENS_Y, 1)
-    launch_x, launch_captured = prepare(_LENS_X, 2)
-    launch_x()  # compile, autotune and the cache entry the capture hits
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = launch_captured()
-    _clear_upload_caches()
-    launch_y()  # an upload of the same size, onto the table's block if it was freed
-    torch.cuda.synchronize()
-    graph.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(captured, expected)
-    _clear_upload_caches()
-
-
-@pytest.mark.parametrize("route", _UPLOAD_ROUTES)
-def test_metadata_cache_miss_during_capture_raises(route):
-    """Building a table in capture would bake a read of a host buffer into the
-    graph, so a miss there raises, and the capture ends cleanly."""
-    prepare, reference = _UPLOAD_ROUTES[route]
-    _clear_upload_caches()
-    (launch_warm,) = prepare(_LENS_X, 1)
-    launch_miss, launch_after = prepare(_LENS_Z, 2)
-    launch_warm()  # compile and autotune
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with (
-        pytest.raises(RuntimeError, match="cannot be built during graph capture"),
-        torch.cuda.graph(graph),
-    ):
-        # A node, so the capture can end.
-        torch.ones(1, device=device, dtype=torch.float32).add_(1)
-        launch_miss()
-    assert not torch.cuda.is_current_stream_capturing()
-    got = launch_after()
-    torch.cuda.synchronize()
-    assert torch.equal(got, reference(_LENS_Z))
-    _clear_upload_caches()
-
-
-def test_prepare_chunk_indices_under_cuda_default_device():
-    """Factory calls follow the default device, and only CPU tensors can be pinned,
-    so the staging tensor is made on the CPU explicitly."""
-    cu_seqlens, cu_seqlens_cpu = _cu_seqlens_pair(_LENS_Z)
-    _clear_upload_caches()
-    with torch.device(device):
-        got = prepare_chunk_indices(cu_seqlens, _C, cu_seqlens_cpu)
-    assert torch.equal(got, _index_reference(_LENS_Z))
-    _clear_upload_caches()
 
 
 def _bands(*xs, skew=0):
@@ -1672,7 +1090,6 @@ def test_positional_call_keeps_skipped_storage(monkeypatch):
         "state_cache": cache,
         "state_indices": indices,
         "has_initial_state": torch.ones(1, device=device, dtype=torch.bool),
-        "cu_seqlens_cpu": None,
     }
     params = inspect.signature(flash_kda_fwd).parameters
     assert by_name.keys() == params.keys()

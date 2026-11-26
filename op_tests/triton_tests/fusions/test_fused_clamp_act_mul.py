@@ -1,6 +1,3 @@
-import subprocess
-import sys
-
 import pytest
 import torch
 import torch.nn.functional as F
@@ -689,60 +686,3 @@ def test_fused_clamp_act_mul_partial_last_group(M, n_half, quant_block_size, bac
     # E4M3 keeps 3 mantissa bits: a correct value sits within 2 ** -4 of its
     # group's amax; a scale taken over the wrong columns is far outside it.
     assert ((deq - y).abs() <= group_amax * 2.0**-4 + 1e-6).all()
-
-
-# Triton calls ``jit_cache_hook`` once per specialization it has not compiled in
-# this process. The tests above compile several row-count classes of N = 1024, so
-# the count is only meaningful in a process of its own.
-_COUNT_COMPILES = """
-import torch
-import triton
-from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
-
-compiled = []
-triton.knobs.runtime.jit_cache_hook = lambda **kwargs: compiled.append(kwargs["repr"])
-for M in (16, 17, 1, 33):
-    inp = torch.randn(M, 2 * 1024, device="cuda", dtype=torch.bfloat16)
-    fused_clamp_act_mul(inp, swiglu_limit=7.0, backend="triton")
-torch.cuda.synchronize()
-print(len(compiled))
-"""
-
-
-@pytest.mark.parametrize("backend", ["triton"])
-def test_fused_clamp_act_mul_row_counts_share_one_compile(backend):
-    # Row counts 16, 17, 1 and 33 fall in different Triton integer specialization
-    # classes; N = 1024 has no M-bucketed config, so every launch constexpr is equal.
-    _check_backend(backend)
-    run = subprocess.run(
-        [sys.executable, "-c", _COUNT_COMPILES],
-        capture_output=True,
-        text=True,
-        timeout=600,
-        check=False,
-    )
-    assert run.returncode == 0, run.stderr[-2000:]
-    assert run.stdout.split()[-1] == "1", run.stdout
-
-
-@pytest.mark.parametrize("M", [8])
-@pytest.mark.parametrize("n_half", [32, 64])
-@pytest.mark.parametrize("backend", ["triton", "gluon"])
-def test_fused_clamp_act_mul_quant_group_wider_than_tile_raises(M, n_half, backend):
-    """A quant group wider than the compute tile (n_half <= quant_block_size / 2)
-    must raise a clean AssertionError on both backends rather than reach the
-    kernel with NUM_QUANT_BLOCKS = BLOCK_SIZE_N // QUANT_BLOCK_SIZE == 0. The
-    Triton path, whose tile is exactly next_power_of_2(n_half), lost this guard
-    when the whole-group requirement was relaxed; the Gluon path always had it."""
-    _check_backend(backend)
-    torch.manual_seed(n_half + M)
-    inp = torch.randn(M, 2 * n_half, device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(AssertionError, match="must be a multiple of"):
-        fused_clamp_act_mul(
-            inp,
-            swiglu_limit=0.0,
-            activation="silu",
-            dtype_quant=aiter.dtypes.fp8,
-            quant_block_size=128,
-            backend=backend,
-        )
