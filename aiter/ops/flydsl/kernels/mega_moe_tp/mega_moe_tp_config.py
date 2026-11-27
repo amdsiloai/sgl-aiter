@@ -18,7 +18,6 @@ from ..kernels_common import ceildiv
 from .common import (
     AUX_SC1,
     AUX_SYS,
-    DEADLINE,
     MAX_TP,
 )
 
@@ -522,7 +521,7 @@ def kernel_config(
     XIB = IPB * APL
     SIB = c["SIB"]
     const_expr = fx.const_expr
-    layout_tag = f"{CTRL_INTS}/{FLAG_INTS}/{DEADLINE}/{NCTA_MAX}"
+    layout_tag = f"{CTRL_INTS}/{FLAG_INTS}/{NCTA_MAX}"
     return KernelCtx(**locals())
 
 

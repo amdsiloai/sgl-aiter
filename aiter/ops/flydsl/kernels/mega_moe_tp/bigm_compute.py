@@ -132,12 +132,14 @@ class MegaMoeTPBigM:
         ygather=False,
         situ=(1.0, 1.0),
         shared=None,
+        wait_ticks,
     ):
         """shared: the shared expert's (index experts) MXFP8 (w1, w1_scale, w2, w2_scale)
         (mega_moe_tp.shuffle_weight_mega_fp8 + e8m0_shuffle); w1 / w2 then the routed ones
         only (experts)"""
         self.sh8 = shared is not None
         self.H, self.I, self.E, self.K = hidden, inter, experts, topk
+        self.wait_ticks = wait_ticks  # the waits' limit (s_memrealtime ticks)
         self.K1, self.NE = topk + 1, experts + 1
         self.tp = dist.get_world_size(group)
         self.rank = dist.get_rank(group)
@@ -515,8 +517,9 @@ class MegaMoeTPBigM:
 
     def _run(self, launch, args):
         if launch not in self._ready:
-            # compile (or load) on every rank first: the kernel's waits on peers have a 2 s
-            # watchdog, a launch must not start while a peer is still compiling
+            # compile (or load) on every rank first: the kernel's waits on peers give up
+            # wait_ticks after the launch starts, a launch must not start while a peer is
+            # still compiling
             _bigm_cached(launch, args)
             torch.cuda.synchronize()
             dist.barrier(group=self.sd.group)
@@ -751,6 +754,7 @@ class MegaMoeTPBigM:
                 self.rank,
                 m,
                 self._ucap(T),
+                self.wait_ticks,
                 self.cu,
                 torch.cuda.current_stream(),
             ),

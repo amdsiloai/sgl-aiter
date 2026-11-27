@@ -19,19 +19,19 @@ from .common import (
     ACQ_REL,
     AUX_SC1,
     AUX_SYS,
-    DEADLINE,
     MAX_TP,
     REL,
     V2I,
     V4I,
     _ctpop,
-    alive,
     amax,
     before,
+    before_end,
     bf16x8_to_f32,
     bld,
     bst,
     cat8,
+    deadline_in,
     e8_scale,
     fp4_pack,
     fp8x4_pack,
@@ -52,7 +52,6 @@ from .common import (
     lds_st,
     make_trace,
     mxfp8x8,
-    now,
     pack_bf16x8,
     poll_sys_ge,
     rsrc,
@@ -262,18 +261,19 @@ def build_communication(kc: KernelCtx) -> dict:
             report(a, code)
 
     @flyc.jit
-    def poll_zero(fn, a=None, lane=None, err=0):
+    def poll_zero(fn, a, lane=None, err=0):
         pend = fn()
-        t0 = now()
-        while (pend != i32(0)) & alive(t0):
+        while (pend != i32(0)) & before_end(a["wait_end"]):
             rocdl.s_sleep(1)
             pend = fn()
         if const_expr(err != 0):
             _report_if(a, (pend != i32(0)) & (lane == i32(0)), err)
 
     @flyc.jit
-    def spin_sys_ge(addr, target, a=None):
-        cur = poll_sys_ge(addr, target)
+    def spin_sys_ge(addr, target, a=None, *, end=None):
+        if const_expr(end is None):
+            end = deadline_in(a["wait_ticks"])
+        cur = poll_sys_ge(addr, target, end=end)
         if const_expr(a is not None):
             _report_if(a, before(cur, target), ERR_FLAG)
 
@@ -712,8 +712,7 @@ def build_communication(kc: KernelCtx) -> dict:
         pk = recv_pkts(a, r_recv, row, a["mmax"], c0, vc)
         live = [(i32(p) < a["tp"]) & (v < i32(CW // 8)) for p in range(MAX_TP)] * APL
         pend = ll_pending(a, lane, zip(pk, live))
-        t0 = now()
-        while (pend != i32(0)) & alive(t0):
+        while (pend != i32(0)) & before_end(a["wait_end"]):
             rocdl.s_sleep(1)
             pk = recv_pkts(a, r_recv, row, a["mmax"], c0, vc)
             pend = ll_pending(a, lane, zip(pk, live))
@@ -924,17 +923,12 @@ def build_communication(kc: KernelCtx) -> dict:
 
     @flyc.jit
     def poll_loop(L, tid, a, epoch):
-        t0 = now()
-        while _comm_pending(L) & alive(t0):
+        while _comm_pending(L) & before_end(a["wait_end"]):
             p1 = comm_signal(L, tid, a, epoch)
             p2 = poll_ready(L, tid % i32(64), a, epoch)
             if (p1 | p2) == i32(0):
                 rocdl.s_sleep(POLL_SLEEP)
-        _report_if(
-            a,
-            (now() - t0 >= fx.Int64(DEADLINE)) & ((tid % i32(64)) == i32(0)),
-            ERR_COMM,
-        )
+        _report_if(a, _comm_pending(L) & ((tid % i32(64)) == i32(0)), ERR_COMM)
 
     def _final_ready(a, c, epoch):
         if const_expr(ll_rs):
@@ -1072,38 +1066,35 @@ def build_communication(kc: KernelCtx) -> dict:
 
     @flyc.jit
     def signal_loop(L, tid, a, epoch):
-        t0 = now()
-        while (lds_ld_acq(L, L_CTL + C_NSIG * 4) < i32(NCK)) & alive(t0):
+        t_end = deadline_in(a["wait_ticks"])
+        while (lds_ld_acq(L, L_CTL + C_NSIG * 4) < i32(NCK)) & before_end(t_end):
             if comm_signal(L, tid, a, epoch) == i32(0):
                 rocdl.s_sleep(1)
 
-    @flyc.jit
-    def comm_wave(L, tid, a, epoch):
-        t0 = now()
-        while (
+    def _wave_pending(L):
+        return (
             (lds_ld_acq(L, L_CTL + C_NSIG * 4) < i32(NCK))
             | (lds_ld_acq(L, L_CTL + C_LRED * 4) < i32(NV))
             | (lds_ld_acq(L, L_CTL + C_PULL * 4) < i32(NV))
-        ) & alive(t0):
+        )
+
+    @flyc.jit
+    def comm_wave(L, tid, a, epoch):
+        while _wave_pending(L) & before_end(a["wait_end"]):
             p1 = comm_signal(L, tid, a, epoch)
             if const_expr(not ARLL):
                 p1 = p1 | poll_ready(L, tid % i32(64), a, epoch)
             p2 = comm_work(L, tid, a, epoch)
             if (p1 | p2) == i32(0):
                 rocdl.s_sleep(POLL_SLEEP)
-        _report_if(
-            a,
-            (now() - t0 >= fx.Int64(DEADLINE)) & ((tid % i32(64)) == i32(0)),
-            ERR_COMM,
-        )
+        _report_if(a, _wave_pending(L) & ((tid % i32(64)) == i32(0)), ERR_COMM)
 
     @flyc.jit
     def comm_help(L, tid, a, epoch):
-        t0 = now()
         while (
             (lds_ld_acq(L, L_CTL + C_LRED * 4) < i32(NV))
             | (lds_ld_acq(L, L_CTL + C_PULL * 4) < i32(NV))
-        ) & alive(t0):
+        ) & before_end(a["wait_end"]):
             if comm_work(L, tid, a, epoch) == i32(0):
                 rocdl.s_sleep(POLL_SLEEP)
 
@@ -1236,8 +1227,8 @@ def build_communication(kc: KernelCtx) -> dict:
             mp = (ag_split(a) > i32(1)).select(
                 i32(0), _meta_pending(a, lane, a["epoch"], own=True)
             )
-            t0 = now()
-            while (mp != i32(0)) & alive(t0):
+            t_end = deadline_in(a["wait_ticks"])
+            while (mp != i32(0)) & before_end(t_end):
                 rocdl.s_sleep(1)
                 mp = _meta_pending(a, lane, a["epoch"], own=True)
         r = lane // i32(XLPR)
@@ -1501,8 +1492,7 @@ def build_communication(kc: KernelCtx) -> dict:
             # last arrival plus one memory latency, not one latency per late packet)
             pks = ld_all()
             pend = pending(pks)
-            t0 = now()
-            while (pend != i32(0)) & alive(t0):
+            while (pend != i32(0)) & before_end(a["wait_end"]):
                 rocdl.s_sleep(1)
                 pks = ld_all()
                 pend = pending(pks)
@@ -1568,8 +1558,8 @@ def build_communication(kc: KernelCtx) -> dict:
         memory system is idle -> C_AGALL (gives up after ~20 us: the A loader still waits
         per chunk, and reports a missing chunk)"""
         rdy = _ag_first_pending(lane, a, epoch, i32(0), NCH)
-        t0 = now()
-        while (rdy < i32(NCH)) & ((now() - t0) < fx.Int64(2000)):
+        t_end = deadline_in(2000)
+        while (rdy < i32(NCH)) & before_end(t_end):
             rocdl.s_sleep(1)
             rdy = _ag_first_pending(lane, a, epoch, rdy, NCH)
         if (lane == i32(0)) & (rdy >= i32(NCH)):
@@ -1580,8 +1570,7 @@ def build_communication(kc: KernelCtx) -> dict:
         rdy = _ag_first_pending(lane, a, epoch, cc, AG_WIN)
         if cc == i32(0):
             rdy = _ag_first_pending(lane, a, epoch, i32(0), NCH)
-        t0 = now()
-        while (rdy <= cc) & alive(t0):
+        while (rdy <= cc) & before_end(a["wait_end"]):
             rocdl.s_sleep(1)
             rdy = _ag_first_pending(lane, a, epoch, cc, AG_WIN)
         _report_if(a, (rdy <= cc) & (lane == i32(0)), ERR_CHUNK)
@@ -1735,8 +1724,8 @@ def build_communication(kc: KernelCtx) -> dict:
             return wave_red(bad, lane, fx.max)
 
         pend = pending()
-        t0 = now()
-        while (pend != i32(0)) & alive(t0):
+        t_end = deadline_in(a["wait_ticks"])
+        while (pend != i32(0)) & before_end(t_end):
             rocdl.s_sleep(2)
             pend = pending()
         _report_if(a, (pend != i32(0)) & (lane == i32(0)), ERR_COMM)
@@ -1777,8 +1766,8 @@ def build_communication(kc: KernelCtx) -> dict:
         if const_expr(TOPK * npc * APL <= 24):
             pk = _dll_rows(a, t, c0, vc, P, npc)
             pend = ll_pending(a, lane, zip(pk, live))
-            t0 = now()
-            while (pend != i32(0)) & alive(t0):
+            t_end = deadline_in(a["wait_ticks"])
+            while (pend != i32(0)) & before_end(t_end):
                 rocdl.s_sleep(2)
                 pk = _dll_rows(a, t, c0, vc, P, npc)
                 pend = ll_pending(a, lane, zip(pk, live))
@@ -1800,8 +1789,8 @@ def build_communication(kc: KernelCtx) -> dict:
                 return pd
 
             pend = pend_all()
-            t0 = now()
-            while (pend != i32(0)) & alive(t0):
+            t_end = deadline_in(a["wait_ticks"])
+            while (pend != i32(0)) & before_end(t_end):
                 rocdl.s_sleep(2)
                 pend = pend_all()
             for k in range_constexpr(TOPK):
@@ -1852,8 +1841,7 @@ def build_communication(kc: KernelCtx) -> dict:
         live = [(i32(p) < a["tp"]) & (v < i32(CW // 8)) for p in range(MAX_TP)] * APL
         pk = recv_pkts(a, r_recv, t, trows, c0, vc)
         pend = ll_pending(a, lane, zip(pk, live))
-        t0 = now()
-        while (pend != i32(0)) & alive(t0):
+        while (pend != i32(0)) & before_end(a["wait_end"]):
             rocdl.s_sleep(1)
             pk = recv_pkts(a, r_recv, t, trows, c0, vc)
             pend = ll_pending(a, lane, zip(pk, live))
@@ -1905,8 +1893,7 @@ def build_communication(kc: KernelCtx) -> dict:
             )
 
         pend = pending()
-        t0 = now()
-        while (pend != i32(0)) & alive(t0):
+        while (pend != i32(0)) & before_end(a["wait_end"]):
             rocdl.s_sleep(1)
             pend = pending()
         _report_if(a, (pend != i32(0)) & (lane == i32(0)), ERR_COMM)

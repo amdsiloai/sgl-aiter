@@ -18,10 +18,13 @@ Contract:
 * The kernel is persistent (one CTA per CU, CTAs and ranks spin on each other): it
   needs the whole GPU. Do not run it concurrently with other kernels (other streams,
   other processes, CU-masked / partitioned GPUs).
-* A wait that times out (2 s) sets a sticky bit and the launch's output is invalid.
-  ``error_flag()`` is that bit as a device tensor (copy it asynchronously, e.g. every N
-  steps); ``check_errors()`` synchronizes and raises; ``reset()`` (collective) restarts
-  the cross-rank state, which a timed-out launch leaves inconsistent.
+* A launch's waits on peer ranks give up ``wait_timeout_ms`` (2 s by default) after it
+  starts: a timeout sets a sticky bit and the launch's output is invalid. ``error_flag()``
+  is that bit as a device tensor (copy it asynchronously, e.g. every N steps);
+  ``check_errors()`` synchronizes and raises; ``reset()`` (collective) restarts the
+  cross-rank state, which a timed-out launch leaves inconsistent. While the bit is set,
+  later launches skip their waits on peers (their outputs are invalid too); clearing it
+  without ``reset()`` leaves the ranks out of step.
 * The returned tensors (``out=None``, ar outputs, the fused tail's rows) are views of
   internal buffers, valid until the next forward of this instance; pass ``out=`` to keep
   the output.
@@ -204,6 +207,10 @@ class MegaMoeTPConfig:
     # max_local_tokens is an upper bound: without a big-M path, lowered to what the small
     # engine holds (MegaMoeTP.max_local_tokens) instead of raising
     fit_max_local: bool = False
+    # how long a launch's waits on peer ranks may take, in ms from the launch's start: it
+    # must cover how late a peer can reach the launch plus the launch's own run time; the
+    # same on every rank (checked at construction)
+    wait_timeout_ms: int = 2000
 
 
 class MegaMoeTP:
@@ -329,6 +336,7 @@ class MegaMoeTP:
             "device": device,
             "fit_max_local": fit,
             "shared": shared,
+            "wait_timeout_ms": cfg.wait_timeout_ms,
         }
         self.engine = MegaMoeTPEngine(**kw)
         if big_ok and bmin != 0 and self.engine.mmax < small_max:
@@ -567,6 +575,7 @@ class MegaMoeTP:
                         else None
                     )
                 ),
+                wait_ticks=self.engine.wait_ticks,
             )
         return self._bigm
 
@@ -703,7 +712,7 @@ class MegaMoeTP:
     def check_errors(self) -> None:
         """Raise RuntimeError (and clear) if a wait gave up since the last check."""
         if self._bigm is not None and self._bigm.poll_errors():
-            self._bigm.clear_errors()
+            self.clear_errors()
             raise RuntimeError(
                 "MegaMoeTP: a big-M wait on a peer gave up (results invalid)"
             )
