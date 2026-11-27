@@ -5077,9 +5077,11 @@ def get_2stage_cfgs(
                     "using default heuristics"
                 )
 
-    # Runtime SiLU clamping is supported only by the non-split CK stage-1 epilogue
-    # and, for gfx942 per-token FP8, the FlyDSL backend, so it must reject ASM
-    # 1-stage and other FlyDSL whole-graph rows before they resolve.
+    # Runtime SiLU clamping runs only in CK stage 1 (in its non-split epilogue, or
+    # in silu_and_mul after a per_1x128 split-K reduction) and, for gfx942
+    # per-token FP8, in the FlyDSL backend. Apart from those FlyDSL rows, tuned
+    # rows are kept only for non-split CK SiLU kernels, so ASM 1-stage, split-K
+    # and other FlyDSL whole-graph rows are rejected before they resolve.
     clamp_silu_limit = (
         bool(swiglu_limit)
         and q_type in RUNTIME_SILU_LIMIT_QUANT_TYPES
@@ -5420,8 +5422,10 @@ def get_2stage_cfgs(
         kernelName2 = kernelName2.replace("_afp4_", "_afp8_", 1)
 
     if clamp_silu_limit:
-        # Deliberately override tuned, heuristic and AITER_KSPLIT selections.
-        ksplit = 0
+        # Only per_1x128 has a CK split-K stage 1 that clamps after the reduction
+        # (ck_moe_stage1); the other clamped types run non-split.
+        if q_type != QuantType.per_1x128:
+            ksplit = 0
         run_1stage = False
 
     reroute_a16wmix_bf16 = _can_reroute_bf16_to_a16wmix(
