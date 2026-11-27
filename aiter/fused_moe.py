@@ -5553,20 +5553,41 @@ def get_2stage_cfgs(
             and q_dtype_w == dtypes.fp4x2
         )
         _s1_fp4q = is_flydsl1 and "_fp4" in kernelName1.split("_t")[-1]
+        # Given a pad, stage 1 may leave that many trailing columns of its uninitialized
+        # output unwritten, so it gets only the columns its stage 2 skips: the Opus stage
+        # 2 reads the unpadded width, the v1 FlyDSL one skips whole 128-column blocks of
+        # the last K tile it runs with (resolve_flydsl_stage2_tile_k), CK-Tile whole
+        # 128-column blocks, and the v2 layout and CK ones read every column. Stage 1
+        # computes the others: zero from w1's zero padding, times w2's zero padding.
+        if is_opus2:
+            stage1_inter_dim_pad = intermediate_pad
+        elif is_flydsl2 and not is_flydsl2_layout:
+            flydsl_moe_kernels = _get_flydsl_moe_kernels()
+            params2 = flydsl_moe_kernels.get_flydsl_kernel_params(kernelName2)
+            if params2 is None:
+                raise ValueError(f"Invalid FlyDSL GEMM2 kernel name: {kernelName2}")
+            tile_k2 = flydsl_moe_kernels.resolve_flydsl_stage2_tile_k(
+                inter_dim, params2["tile_k"]
+            )
+            stage1_inter_dim_pad = min(tile_k2, intermediate_pad // 128 * 128)
+        elif is_cktile2:
+            stage1_inter_dim_pad = intermediate_pad // 128 * 128
+        else:
+            stage1_inter_dim_pad = 0
         if is_opus1:
             stage1_func = functools.partial(
                 _opus_a8w4_stage1_wrapper,
                 kernelName=kernelName1,
                 activation=activation,
                 block_m=block_m,
-                inter_dim_pad=intermediate_pad,
+                inter_dim_pad=stage1_inter_dim_pad,
             )
         elif is_flydsl1:
             stage1_func = functools.partial(
                 _flydsl_stage1_wrapper,
                 kernelName=kernelName1,
                 activation=activation,
-                inter_dim_pad=intermediate_pad,
+                inter_dim_pad=stage1_inter_dim_pad,
                 model_dim_pad=hidden_pad,
             )
         else:
@@ -6240,6 +6261,46 @@ def fused_moe_2stages(
     )
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
+    if metadata.run_1stage:
+        # metadata.stage1 may be a complete, single-call kernel (e.g.
+        # fused_moe_1stage) rather than a genuine stage1-of-two: its return
+        # value IS the final output, not an intermediate for stage2 to
+        # consume. _fused_moe_impl's own top-level dispatch already knows
+        # this and returns metadata.stage1(...) directly without ever
+        # calling a stage2 (see its own `if metadata.run_1stage:` branch
+        # above in this file). This function must do the same whenever it
+        # is handed, or itself resolves, a run_1stage=True metadata --
+        # unconditionally treating _stage1_call()'s result as an
+        # intermediate either crashes on an argument-convention mismatch
+        # (stage1-of-two and 1-stage kernels take different arguments) or,
+        # worse, silently reruns stage2 over an already-finished result.
+        return _return_output(
+            metadata.stage1(
+                hidden_states,
+                w1,
+                w2,
+                topk,
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                moe_out,
+                isG1U1,
+                block_size_M,
+                q_dtype_a=q_dtype_a,
+                q_dtype_w=q_dtype_w,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                a1_scale=a1_scale,
+                a2_scale=a2_scale,
+                num_local_tokens=num_local_tokens,
+                M=token_num,
+                device=device,
+                doweight_stage1=doweight_stage1,
+                expert_mask=expert_mask,
+            ),
+            output,
+        )
     if (
         getattr(metadata.stage1, "func", metadata.stage1) is _mxfp4_a4w4_stage1_fw
         and metadata.output_aux == AUX_SORT_OPUS
